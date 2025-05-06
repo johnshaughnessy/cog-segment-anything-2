@@ -10,7 +10,8 @@ import torch
 import subprocess
 import numpy as np
 from PIL import Image
-from typing import List
+from typing import List, Optional
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 # Add /tmp/sa2 to sys path
 sys.path.extend("/sa2")
 from sam2.build_sam import build_sam2
@@ -44,65 +45,49 @@ class Predictor(BasePredictor):
         if torch.cuda.get_device_properties(0).major >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+        
+        # Initialize SAM2ImagePredictor
+        self.predictor = SAM2ImagePredictor(self.sam2)
 
     def predict(
         self,
         image: Path = Input(description="Input image"),
-        mask_limit: int = Input(
-            default=-1, description="maximum number of masks to return. If -1 or None, all masks will be returned. NOTE: The masks are sorted by predicted_iou."),
-        points_per_side: int = Input(
-            default=64, description="The number of points to be sampled along one side of the image."),
-        points_per_batch: int = Input(
-            default=128, description="Sets the number of points run simultaneously by the model"),
-        pred_iou_thresh: float = Input(
-            default=0.7, description="A filtering threshold in [0,1], using the model's predicted mask quality."),
-        stability_score_thresh: float = Input(
-            default=0.92, description="A filtering threshold in [0,1], using the stability of the mask under changes to the cutoff used to binarize the model's mask predictions."),
-        stability_score_offset: float = Input(
-            default=0.7, description="The amount to shift the cutoff when calculated the stability score."),
-        crop_n_layers: int = Input(
-            default=1, description="If >0, mask prediction will be run again on crops of the image"),
-        box_nms_thresh: float = Input(
-            default=0.7, description="The box IoU cutoff used by non-maximal suppression to filter duplicate masks."),
-        crop_n_points_downscale_factor: int = Input(
-            default=2, description="The number of points-per-side sampled in layer n is scaled down by crop_n_points_downscale_factor**n."),
-        min_mask_region_area: float = Input(
-            default=25.0, description="If >0, postprocessing will be applied to remove disconnected regions and holes in masks with area smaller than min_mask_region_area."),
-        mask_2_mask: bool = Input(
-            default=True, description="Whether to add a one step refinement using previous mask predictions."),
-        multimask_output: bool = Input(
-            default=False, description="Whether to output multimask at each point of the grid."),
+        point_coords: Optional[List[List[float]]] = Input(description="List of [x, y] point coordinates", default=None),
+        point_labels: Optional[List[int]] = Input(description="List of point labels (1 for foreground, 0 for background)", default=None),
+        box: Optional[List[float]] = Input(description="Box coordinates [x1, y1, x2, y2]", default=None),
+        mask_input: Optional[Path] = Input(description="Path to mask input image (256x256)", default=None),
+        multimask_output: bool = Input(description="Whether to output multiple masks", default=True),
+        normalize_coords: bool = Input(description="Whether to normalize coordinates to [0,1]", default=True),
     ) -> List[Path]:
-        """Run a single prediction on the model"""
-        # Convert input image
-        image_rgb = Image.open(image).convert('RGB')
-        image_arr = np.array(image_rgb)
-
-        # Setup the predictor and image
-        mask_generator = SAM2AutomaticMaskGenerator(
-            model=self.sam2,
-            points_per_side=points_per_side,
-            points_per_batch=points_per_batch,
-            pred_iou_thresh=pred_iou_thresh,
-            stability_score_thresh=stability_score_thresh,
-            stability_score_offset=stability_score_offset,
-            crop_n_layers=crop_n_layers,
-            box_nms_thresh=box_nms_thresh,
-            crop_n_points_downscale_factor=crop_n_points_downscale_factor,
-            min_mask_region_area=min_mask_region_area,
-            use_m2m=mask_2_mask,
+        # Load image
+        image_pil = Image.open(image).convert('RGB')
+        # Set image
+        self.predictor.set_image(image_pil)
+        # Prepare prompts
+        point_coords_np = np.array(point_coords, dtype=np.float32) if point_coords is not None else None
+        point_labels_np = np.array(point_labels, dtype=np.int32) if point_labels is not None else None
+        box_np = np.array(box, dtype=np.float32) if box is not None else None
+        if mask_input is not None:
+            mask_pil = Image.open(mask_input).convert('L')
+            mask_pil = mask_pil.resize((256, 256), Image.BILINEAR)
+            mask_np = np.array(mask_pil, dtype=np.float32)[None, :, :]
+        else:
+            mask_np = None
+        # Call predict
+        masks, _, _ = self.predictor.predict(
+            point_coords=point_coords_np,
+            point_labels=point_labels_np,
+            box=box_np,
+            mask_input=mask_np,
             multimask_output=multimask_output,
+            return_logits=False,
+            normalize_coords=normalize_coords,
         )
-        sam_output = mask_generator.generate(image_arr)
-        # Sort masks by `predicted_iou`
-        masks = [mask['segmentation'] for mask in sorted(sam_output, key=lambda x: x['predicted_iou'], reverse=True)]
-
-        # Save the masks + mased to files
+        # Save masks
         return_masks = []
-        for i, mask in enumerate(masks[:mask_limit]):
-            # create a binary mask from the boolean array
-            mask_image = np.uint8(mask) * 255
-            mask_filename = f"/tmp/mask_{i}.png"
-            cv2.imwrite(mask_filename, mask_image)
-            return_masks.append(Path(f"/tmp/mask_{i}.png"))
+        for i, mask in enumerate(masks):
+            mask_img = (mask * 255).astype(np.uint8)
+            mask_path = Path(f"/tmp/mask_{i}.png")
+            Image.fromarray(mask_img).save(mask_path)
+            return_masks.append(mask_path)
         return return_masks
